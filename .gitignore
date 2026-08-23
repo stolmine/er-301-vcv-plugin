@@ -7,6 +7,7 @@ plugin.dylib
 *.d
 
 # SDK (user downloads separately)
+Rack-SDK
 Rack-SDK/
 
 # Dependencies

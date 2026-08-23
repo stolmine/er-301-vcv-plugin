@@ -226,9 +226,15 @@ struct ER301Module : Module
 
     TLS_setName("main");
 
-    // Create directories — store as member variables so pointers stay valid
+    // Create directories — store as member variables so pointers stay valid.
+    // Only the REAR card is isolated (~/.od-vcv): its DSP packages must be built
+    // with clang/libc++ to match this plugin's std::string ABI, whereas the SDL
+    // emulator's ~/.od packages are GCC. The FRONT card (samples, recordings,
+    // quicksaves, browser history) has no ABI-specific content, so we SHARE the
+    // emulator's ~/.od/front — that's where the user's samples live, and its
+    // persisted browser paths resolve correctly there.
     std::string homeDir = getenv("HOME");
-    rearRootStr = homeDir + "/.od/rear";
+    rearRootStr = homeDir + "/.od-vcv/rear";
     frontRootStr = homeDir + "/.od/front";
 
     // Find xroot — bundled with plugin or from er-301 source
@@ -645,10 +651,191 @@ struct ER301Knob : SvgWidget
   }
 };
 
+// ─── Keyboard capture layer ───
+// A transparent, focusable widget over the main display. Clicking it (or the
+// context-menu action) grabs keyboard focus, after which physical key presses
+// drive the ER-301 controls through the same GPIO/encoder path the mouse uses.
+// The keymap mirrors the SDL emulator (emu/Emulator.cpp loadDefaultConfiguration).
+// Focus/consume approach follows monome-rack's TeletypeScreenWidget.
+struct ER301KeyboardCapture : OpaqueWidget
+{
+  ER301Module *module = nullptr;
+  ER301Toggle *storageToggle = nullptr;
+  ER301Toggle *modeToggle = nullptr;
+  bool storageFocus = false; // Z held: arrows drive the STORAGE toggle
+  bool modeFocus = false;    // X held: arrows drive the MODE toggle
+
+  // Emulator encoder tuning (constants.h ENCODER_SPEED = 5): Left/Right are the
+  // coarse jump, Up/Down the fine single step (integerised from the emu's 5 / 1.25).
+  static constexpr int ENC_COARSE = 5;
+  static constexpr int ENC_FINE = 1;
+
+  // GLFW key (US-QWERTY physical position, matching the emulator) → GPIO button id.
+  static int buttonForKey(int key)
+  {
+    switch (key)
+    {
+    case GLFW_KEY_Q: return BUTTON_MAIN1;
+    case GLFW_KEY_W: return BUTTON_MAIN2;
+    case GLFW_KEY_E: return BUTTON_MAIN3;
+    case GLFW_KEY_R: return BUTTON_MAIN4;
+    case GLFW_KEY_T: return BUTTON_MAIN5;
+    case GLFW_KEY_Y: return BUTTON_MAIN6;
+    case GLFW_KEY_A: return BUTTON_DIAL1;
+    case GLFW_KEY_S: return BUTTON_DIAL2;
+    case GLFW_KEY_D: return BUTTON_DIAL3;
+    case GLFW_KEY_F: return BUTTON_SUB1;
+    case GLFW_KEY_G: return BUTTON_SUB2;
+    case GLFW_KEY_H: return BUTTON_SUB3;
+    case GLFW_KEY_V: return BUTTON_ENTER;
+    case GLFW_KEY_B: return BUTTON_UP;
+    case GLFW_KEY_N: return BUTTON_SHIFT;
+    case GLFW_KEY_1: return BUTTON_SELECT1;
+    case GLFW_KEY_2: return BUTTON_SELECT2;
+    case GLFW_KEY_3: return BUTTON_SELECT3;
+    case GLFW_KEY_4: return BUTTON_SELECT4;
+    default: return -1;
+    }
+  }
+
+  // Release every mappable button (idempotent — Gpio_write only emits on a
+  // transition). Called on deselect so a key held while focus is lost can't
+  // leave a button stuck LOW/pressed.
+  void releaseAllButtons()
+  {
+    static const int ids[] = {
+        BUTTON_MAIN1, BUTTON_MAIN2, BUTTON_MAIN3, BUTTON_MAIN4, BUTTON_MAIN5, BUTTON_MAIN6,
+        BUTTON_DIAL1, BUTTON_DIAL2, BUTTON_DIAL3, BUTTON_SUB1, BUTTON_SUB2, BUTTON_SUB3,
+        BUTTON_ENTER, BUTTON_UP, BUTTON_SHIFT,
+        BUTTON_SELECT1, BUTTON_SELECT2, BUTTON_SELECT3, BUTTON_SELECT4};
+    for (int id : ids)
+      Gpio_write(id, true);
+  }
+
+  // Step a 3-position toggle one notch toward "up" (dir<0) or "down" (dir>0),
+  // mirroring the emulator's switchUp/switchDown (end → center → other end).
+  void stepToggle(ER301Toggle *t, int dir)
+  {
+    if (!t)
+      return;
+    int s = t->state + (dir > 0 ? 1 : -1);
+    if (s < 0)
+      s = 0;
+    if (s > 2)
+      s = 2;
+    t->setState(s);
+  }
+
+  void onButton(const ButtonEvent &e) override
+  {
+    if (e.button == GLFW_MOUSE_BUTTON_LEFT && e.action == GLFW_PRESS)
+    {
+      APP->event->setSelectedWidget(this); // grab keyboard focus
+      e.consume(this);
+      return;
+    }
+    OpaqueWidget::onButton(e);
+  }
+
+  void onDeselect(const DeselectEvent &e) override
+  {
+    releaseAllButtons();
+    storageFocus = false;
+    modeFocus = false;
+    OpaqueWidget::onDeselect(e);
+  }
+
+  void onSelectKey(const SelectKeyEvent &e) override
+  {
+    if (!module)
+    {
+      OpaqueWidget::onSelectKey(e);
+      return;
+    }
+
+    const bool down = (e.action == GLFW_PRESS);
+    const bool up = (e.action == GLFW_RELEASE);
+    const bool repeat = (e.action == GLFW_REPEAT);
+
+    // Toggle-focus modifiers, held like the emulator's Z / X.
+    if (e.key == GLFW_KEY_Z)
+    {
+      if (down)
+        storageFocus = true;
+      else if (up)
+        storageFocus = false;
+      e.consume(this);
+      return;
+    }
+    if (e.key == GLFW_KEY_X)
+    {
+      if (down)
+        modeFocus = true;
+      else if (up)
+        modeFocus = false;
+      e.consume(this);
+      return;
+    }
+
+    // Arrow keys: encoder, or a focused toggle when Z/X is held.
+    if (e.key == GLFW_KEY_LEFT || e.key == GLFW_KEY_RIGHT ||
+        e.key == GLFW_KEY_UP || e.key == GLFW_KEY_DOWN)
+    {
+      if (down || repeat)
+      {
+        switch (e.key)
+        {
+        case GLFW_KEY_RIGHT:
+          VCV_addEncoderDelta(+ENC_COARSE);
+          break;
+        case GLFW_KEY_LEFT:
+          VCV_addEncoderDelta(-ENC_COARSE);
+          break;
+        case GLFW_KEY_UP:
+          if (storageFocus)
+            stepToggle(storageToggle, -1);
+          else if (modeFocus)
+            stepToggle(modeToggle, -1);
+          else
+            VCV_addEncoderDelta(+ENC_FINE);
+          break;
+        case GLFW_KEY_DOWN:
+          if (storageFocus)
+            stepToggle(storageToggle, +1);
+          else if (modeFocus)
+            stepToggle(modeToggle, +1);
+          else
+            VCV_addEncoderDelta(-ENC_FINE);
+          break;
+        }
+      }
+      e.consume(this);
+      return;
+    }
+
+    // Buttons: press on key-down, release on key-up. REPEAT is ignored — the
+    // button is already held LOW and the engine runs its own auto-repeat.
+    int id = buttonForKey(e.key);
+    if (id >= 0)
+    {
+      if (down)
+        Gpio_write(id, false);
+      else if (up)
+        Gpio_write(id, true);
+      e.consume(this);
+      return;
+    }
+
+    // Swallow all other keys while focused so Rack's global shortcuts don't fire.
+    e.consume(this);
+  }
+};
+
 struct ER301Widget : ModuleWidget
 {
   int mainImage = -1;
   int subImage = -1;
+  ER301KeyboardCapture *keyboardCapture = nullptr;
   static constexpr int UPSCALE = 4;
   uint8_t mainPixels[MAIN_HORIZONTAL_PIXELS * UPSCALE * MAIN_VERTICAL_PIXELS * UPSCALE * 4];
   uint8_t subPixels[SUB_HORIZONTAL_PIXELS * UPSCALE * SUB_VERTICAL_PIXELS * UPSCALE * 4];
@@ -781,16 +968,13 @@ struct ER301Widget : ModuleWidget
     addChild(createER301Button(BUTTON_SHIFT, mm2px(Vec(76.909f, 110.153f)), blueBtn));
 
     // ── Toggle switches (3-position with SVG frames) ──
-    {
-      ER301Toggle *t = new ER301Toggle(TOGGLE_STORAGE_A, TOGGLE_STORAGE_B);
-      t->box.pos = mm2px(Vec(4.5f, 110.5f));
-      addChild(t);
-    }
-    {
-      ER301Toggle *t = new ER301Toggle(TOGGLE_MODE_A, TOGGLE_MODE_B);
-      t->box.pos = mm2px(Vec(33.0f, 110.5f));
-      addChild(t);
-    }
+    ER301Toggle *storageTog = new ER301Toggle(TOGGLE_STORAGE_A, TOGGLE_STORAGE_B);
+    storageTog->box.pos = mm2px(Vec(4.5f, 110.5f));
+    addChild(storageTog);
+
+    ER301Toggle *modeTog = new ER301Toggle(TOGGLE_MODE_A, TOGGLE_MODE_B);
+    modeTog->box.pos = mm2px(Vec(33.0f, 110.5f));
+    addChild(modeTog);
 
     // ── Encoder knob (SVG artwork, centered) ──
     {
@@ -799,6 +983,15 @@ struct ER301Widget : ModuleWidget
       knob->box.pos = Vec(knobCenter.x - knob->box.size.x / 2, knobCenter.y - knob->box.size.y / 2);
       addChild(knob);
     }
+
+    // ── Keyboard capture layer (over the main display) ──
+    keyboardCapture = new ER301KeyboardCapture();
+    keyboardCapture->module = module;
+    keyboardCapture->storageToggle = storageTog;
+    keyboardCapture->modeToggle = modeTog;
+    keyboardCapture->box.pos = Vec(mainDispX, mainDispY);
+    keyboardCapture->box.size = Vec(mainDispW, mainDispH);
+    addChild(keyboardCapture);
   }
 
   ~ER301Widget() {}
@@ -960,6 +1153,29 @@ struct ER301Widget : ModuleWidget
       nvgText(vg, mainDispX + mainDispW - 3, mainDispY + 3,
               mod->sampleRateWarning.c_str(), NULL);
     }
+
+    // ── Keyboard-focus ring (drawn on top of the display) ──
+    if (keyboardCapture && APP->event->selectedWidget == keyboardCapture)
+    {
+      nvgBeginPath(vg);
+      nvgRoundedRect(vg, mainDispX - 1.5f, mainDispY - 1.5f, mainDispW + 3.0f, mainDispH + 3.0f, 5.0f);
+      nvgStrokeColor(vg, nvgRGBA(255, 180, 0, 220));
+      nvgStrokeWidth(vg, 1.5f);
+      nvgStroke(vg);
+    }
+  }
+
+  void appendContextMenu(Menu *menu) override
+  {
+    menu->addChild(new MenuSeparator);
+    menu->addChild(createMenuItem("Capture keyboard (or click the display)", "", [this]()
+                                  {
+      if (keyboardCapture)
+        APP->event->setSelectedWidget(keyboardCapture); }));
+    menu->addChild(createMenuLabel("Q-Y: main softkeys   A-H: sub buttons"));
+    menu->addChild(createMenuLabel("V/B/N: enter/up/shift   1-4: channel select"));
+    menu->addChild(createMenuLabel("Arrows: encoder (L/R coarse, U/D fine)"));
+    menu->addChild(createMenuLabel("Hold Z/X + arrows: STORAGE/MODE toggles"));
   }
 };
 
