@@ -448,6 +448,11 @@ struct ER301Module : Module
 // Forward declarations for encoder HAL
 void VCV_addEncoderDelta(int delta);
 
+// Forward declarations for the I2C follower HAL (src/hal/i2cSlave.cpp)
+bool VCV_i2cPushMessage(uint8_t address, const uint8_t *data, uint8_t length);
+bool VCV_i2cIsSlaveOpen(void);
+uint8_t VCV_i2cGetOwnAddress(void);
+
 // ─── Button with SVG artwork + GPIO interaction ───
 struct ER301Button : SvgWidget
 {
@@ -1176,6 +1181,42 @@ struct ER301Widget : ModuleWidget
     menu->addChild(createMenuLabel("V/B/N: enter/up/shift   1-4: channel select"));
     menu->addChild(createMenuLabel("Arrows: encoder (L/R coarse, U/D fine)"));
     menu->addChild(createMenuLabel("Hold Z/X + arrows: STORAGE/MODE toggles"));
+
+    // ── II / I2C follower debug ──
+    //
+    // Bring-up harness for the I2C receive path, independent of any leader
+    // module: inject a frame exactly as a Teletype would emit it and watch the
+    // bound SC unit respond. The teletype package must be loaded and enabled
+    // (it opens the follower on 0x31 by default) or these are no-ops.
+    menu->addChild(new MenuSeparator);
+    if (VCV_i2cIsSlaveOpen())
+    {
+      menu->addChild(createMenuLabel(
+          rack::string::f("II follower listening on 0x%02x", VCV_i2cGetOwnAddress())));
+
+      menu->addChild(createMenuItem("Inject SC.CV 1 5V", "", []()
+                                    {
+        // 0x10 = SC.CV, port 0 (zero-indexed on the wire), value big-endian
+        // int16 at 16384 LSB per volt -> 5V = 0x5000.
+        const uint8_t frame[4] = {0x10, 0x00, 0x50, 0x00};
+        VCV_i2cPushMessage(VCV_i2cGetOwnAddress(), frame, 4); }));
+
+      menu->addChild(createMenuItem("Inject SC.CV 1 0V", "", []()
+                                    {
+        const uint8_t frame[4] = {0x10, 0x00, 0x00, 0x00};
+        VCV_i2cPushMessage(VCV_i2cGetOwnAddress(), frame, 4); }));
+
+      menu->addChild(createMenuItem("Inject SC.TR.PULSE 1", "", []()
+                                    {
+        // 0x05 = SC.TR.PULSE, port 0. Value is unused but the decoder wants
+        // length > 3 before it will read one.
+        const uint8_t frame[4] = {0x05, 0x00, 0x00, 0x00};
+        VCV_i2cPushMessage(VCV_i2cGetOwnAddress(), frame, 4); }));
+    }
+    else
+    {
+      menu->addChild(createMenuLabel("II follower closed (load the teletype package)"));
+    }
   }
 };
 
