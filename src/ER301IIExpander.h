@@ -4,7 +4,7 @@
 // through Rack's expander message buffers.
 //
 // ═══ THIS FILE IS DUPLICATED ═══
-//   er-301-vcv-stolmine/src/ER301IIExpander.h
+//   er-301-vcv-plugin/src/ER301IIExpander.h
 //   monome-rack-stolmine/src/common/core/ER301IIExpander.h
 // They must stay byte-identical. The two plugins are separate dylibs with no
 // shared build, so there is no way to enforce that at compile time -- hence the
