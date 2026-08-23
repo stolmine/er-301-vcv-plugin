@@ -69,6 +69,7 @@ SOURCES += src/hal/adc.c
 SOURCES += src/hal/i2cSlave.c
 SOURCES += src/hal/dir.c
 SOURCES += src/hal/fft.c
+SOURCES += src/hal/modulemap.cpp
 SOURCES += src/hal/concurrency/Mutex.cpp
 SOURCES += src/hal/concurrency/Thread.cpp
 SOURCES += src/hal/concurrency/EventFlags.cpp
