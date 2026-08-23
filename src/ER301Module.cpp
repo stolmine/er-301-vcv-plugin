@@ -1,4 +1,9 @@
 #include "plugin.hpp"
+#include "ER301IIExpander.h"
+// Forward declarations for the I2C follower HAL (src/hal/i2cSlave.cpp)
+bool VCV_i2cPushMessage(uint8_t address, const uint8_t *data, uint8_t length);
+bool VCV_i2cIsSlaveOpen(void);
+uint8_t VCV_i2cGetOwnAddress(void);
 #include <string>
 #include <thread>
 #include <atomic>
@@ -143,6 +148,12 @@ struct ER301Module : Module
     instanceCount.fetch_add(1, std::memory_order_relaxed);
     config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
 
+    // II / i2c receive buffers. Rack's convention is that the RECEIVER
+    // allocates both halves of the double buffer; allocating on both sides
+    // lets the ER-301 sit to either side of an II leader.
+    allocIIBuffers(leftExpander);
+    allocIIBuffers(rightExpander);
+
     configInput(G1_INPUT, "G1 Gate");
     configInput(G2_INPUT, "G2 Gate");
     configInput(G3_INPUT, "G3 Gate");
@@ -207,6 +218,66 @@ struct ER301Module : Module
       Audio_stop();
     }
     instanceCount.fetch_sub(1, std::memory_order_relaxed);
+
+    freeIIBuffers(leftExpander);
+    freeIIBuffers(rightExpander);
+  }
+
+  static void allocIIBuffers(Expander &e)
+  {
+    e.producerMessage = newIIBuffer();
+    e.consumerMessage = newIIBuffer();
+  }
+
+  static void freeIIBuffers(Expander &e)
+  {
+    delete static_cast<ER301IIExpanderMessage *>(e.producerMessage);
+    delete static_cast<ER301IIExpanderMessage *>(e.consumerMessage);
+    e.producerMessage = nullptr;
+    e.consumerMessage = nullptr;
+  }
+
+  static ER301IIExpanderMessage *newIIBuffer()
+  {
+    // Zero-initialised, header pre-filled: a leader validates these fields
+    // before writing, so they must be valid from the moment the module exists.
+    ER301IIExpanderMessage *m = new ER301IIExpanderMessage();
+    m->magic = ER301_II_MAGIC;
+    m->version = ER301_II_VERSION;
+    m->size = (uint32_t)sizeof(ER301IIExpanderMessage);
+    m->count = 0;
+    return m;
+  }
+
+  // Drain one side's consumer buffer into the i2c follower queue.
+  void consumeII(Expander &e)
+  {
+    ER301IIExpanderMessage *m = static_cast<ER301IIExpanderMessage *>(e.consumerMessage);
+    if (m == nullptr || m->count == 0)
+      return;
+
+    // A neighbour from a mismatched build could have written anything here.
+    if (m->magic != ER301_II_MAGIC || m->version != ER301_II_VERSION ||
+        m->size != (uint32_t)sizeof(ER301IIExpanderMessage))
+    {
+      m->count = 0;
+      return;
+    }
+
+    uint32_t n = m->count;
+    if (n > ER301_II_MAX_FRAMES)
+      n = ER301_II_MAX_FRAMES;
+
+    for (uint32_t i = 0; i < n; i++)
+    {
+      const ER301IIFrame &f = m->frames[i];
+      // Address filtering and timestamping happen inside the HAL.
+      VCV_i2cPushMessage(f.address, f.data, f.length);
+    }
+
+    // Consume once. Without this the same block would be re-injected every
+    // sample for as long as the leader stayed silent.
+    m->count = 0;
   }
 
   void initEngine()
@@ -379,6 +450,11 @@ struct ER301Module : Module
     if (engineFailed.load(std::memory_order_acquire))
       return;
 
+    // Pull any II frames delivered by an adjacent leader before this sample is
+    // pumped, so they land in the frame the engine is about to process.
+    consumeII(leftExpander);
+    consumeII(rightExpander);
+
     // Write one sample of input into the interleaved input frame
     int offset = framePos * NUM_INPUT_CHANNELS;
     for (int i = 0; i < NUM_INPUTS; i++)
@@ -448,10 +524,6 @@ struct ER301Module : Module
 // Forward declarations for encoder HAL
 void VCV_addEncoderDelta(int delta);
 
-// Forward declarations for the I2C follower HAL (src/hal/i2cSlave.cpp)
-bool VCV_i2cPushMessage(uint8_t address, const uint8_t *data, uint8_t length);
-bool VCV_i2cIsSlaveOpen(void);
-uint8_t VCV_i2cGetOwnAddress(void);
 
 // ─── Button with SVG artwork + GPIO interaction ───
 struct ER301Button : SvgWidget
